@@ -10,7 +10,7 @@ by Siavash Khodakarami, Vivek Oommen, Nazanin Ahmadi Daryakenari, and George Em 
 ---
 
 ## Read the paper here:
-<!-- Add link -->
+[Spectral bias in physics-informed and operator learning: Analysis and mitigation guidelines](https://arxiv.org/abs/2602.19265)
 
 ---
 
