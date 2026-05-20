@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.h5
+wandb/
+*.err
+*.out
