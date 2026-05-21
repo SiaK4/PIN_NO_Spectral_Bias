@@ -1,0 +1,480 @@
+import numpy as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import json
+import time
+import torch.nn.functional as F
+import argparse
+from Model.NN1 import NN
+
+from Model.NN1 import xavier_init_weights
+from Model.save_model import save_checkpoint
+from Optimizers.soap_double import SOAP
+from config import get_config, update_config_from_cli, save_config
+import argparse
+import random
+
+L_t = 1
+L = 1
+c = 1
+
+## Load config
+config = get_config()
+config = update_config_from_cli(config)
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU setups
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"Random seed set to {seed}")
+
+seed = config["train"]["seed"]
+set_seed(seed)
+
+device = config["device"]
+model_cfg = config["model"]
+train_cfg = config["train"]
+data_cfg = config["data"]
+weights_cfg = config["weights"]
+
+save_dir = "checkpoints_" + config['train']['checkpoint_name']
+save_config(config, save_dir)
+slope_R_w = config["train"]["slope_R_w"]
+
+
+def w_schedule(w1_org,w2_org, w3_org, w4_org, w5_org, epoch):
+    if epoch <=2000:
+        w1, w2, w3, w4, w5 = w1_org, w2_org, w3_org, w4_org, w5_org
+    if epoch > 2000 and epoch <=1000000:
+         w1, w2, w3, w4, w5 = w1_org, w2_org/2, w3_org/2, w4_org/2, w5_org/2
+    if epoch > 1000000 and epoch <= 2000000:
+        w1, w2, w3, w4, w5 = w1_org, w2_org/10, w3_org/10, w4_org/10, w5_org/10
+    if epoch > 2000000:
+        w1, w2, w3, w4, w5 = w1_org, w2_org/25, w3_org/25, w4_org/25, w4_org/25
+    return w1,w2,w3,w4,w5
+
+def resample_points(points, residuals, num_samples, epoch, epoch_resample):
+    residuals = torch.abs(residuals.squeeze())
+
+    temperature = max(0.1, 1.0 * (0.75 ** (epoch-epoch_resample)))
+    alpha = 0.95  # how much weight to give residual-based probs
+    residual_probs = torch.softmax(residuals / temperature, dim=0)
+    uniform_probs = torch.ones_like(residual_probs) / residual_probs.numel()
+    probabilities = alpha * residual_probs + (1 - alpha) * uniform_probs
+    probabilities = probabilities / probabilities.sum()
+
+    sampled_indices = np.random.choice(points.shape[0], size=num_samples, replace=False, p=probabilities.detach().cpu().numpy())
+    return sampled_indices
+
+def wave(model,X):
+
+    x = X[:,0:1]
+    t = X[:,1:2]
+    u = model(torch.concatenate((x,t),dim=1))
+
+    u_x = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+    u_xx = torch.autograd.grad(u_x, x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+    u_t = torch.autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+    u_tt = torch.autograd.grad(u_t, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+
+    wave_r = u_tt - u_xx
+    return wave_r
+
+def train_step(model, domain_data, init_data, left_b_data, right_b_data, epoch_resample, epoch):
+    ## Residual inside the domain
+    domain_residual = wave(model, domain_data)
+
+    ## Initial condition (magnitude)
+    init_data_input = init_data[:, [0, 1]].clone().detach().requires_grad_(True)
+    init_data_output = init_data[:,-1].detach()
+    init_data_pred = model(init_data_input)
+    init_data_residual = init_data_output.squeeze() - init_data_pred.squeeze()
+
+    ## Initial condition (velocity)
+    init_v_pred = torch.autograd.grad(
+        init_data_pred, 
+        init_data_input[:,1:2],              # derivative w.r.t t
+        grad_outputs=torch.ones_like(init_data_pred),
+        create_graph=True,
+        allow_unused=True
+    )[0]
+    if init_v_pred is None:
+        init_v_pred = u_t_pred_init = init_data_pred * 0
+    ## Left b
+    left_b_input = left_b_data[:,[0,1]]
+    left_b_output = left_b_data[:,-1].detach()
+    left_b_pred = model(left_b_input)
+    left_b_residual = left_b_output.squeeze() - left_b_pred.squeeze()
+
+    ## Right b
+    right_b_input = right_b_data[:,[0,1]]
+    right_b_output = right_b_data[:,-1].detach()
+    right_b_pred = model(right_b_input)
+    right_b_residual = right_b_output.squeeze() - right_b_pred.squeeze()
+
+    return domain_residual.squeeze(), init_data_residual, left_b_residual, right_b_residual, init_v_pred.squeeze()
+
+def random_sampling(data, ratio):
+    n_samples = int(ratio * data.shape[0])
+    indices = torch.randperm(data.shape[0])[:n_samples]
+    sampled_data = data[indices]
+    return sampled_data
+
+def grad_norm(loss, model):
+    grads = torch.autograd.grad(loss, model.parameters(),
+                                retain_graph=True, allow_unused=True)
+    total = 0.0
+    for (name, p), g in zip(model.named_parameters(), grads):
+        if g is None:
+            g = torch.zeros_like(p)
+        total += torch.sum(g ** 2)
+    return torch.sqrt(total).detach()
+
+def train(model, epoch_number, learning_rate, domain_data, init_data, left_b_data, right_b_data, epoch_resample,L1_epoch, double=False):
+    lambda_pde_avg = train_cfg["lambda_pde_avg"]
+    lambda_init_avg = train_cfg["lambda_init_avg"]
+    lambda_init_v_avg = train_cfg["lambda_init_v_avg"]
+    lambda_left_avg = train_cfg["lambda_left_avg"]
+    lambda_right_avg = train_cfg["lambda_right_avg"]
+    grad_norm_interval = train_cfg["grad_norm_interval"]
+    beta = train_cfg["beta"]
+
+    best_loss = float('inf')
+    domain_loss_list = []
+    init_loss_list = []
+    init_v_loss_list = []
+    left_loss_list = []
+    right_loss_list = []
+    total_loss_list = []
+    relative_error_list = []
+
+    w1_org = weights_cfg["w1_org"]
+    w2_org = weights_cfg["w2_org"]
+    w3_org = weights_cfg["w3_org"]
+    w4_org = weights_cfg["w4_org"]
+    w5_org = weights_cfg["w5_org"]
+
+    ########## Double precision change ###########
+    dtype = torch.float64 if double else torch.float32
+
+    model = model.to(device=device, dtype=dtype) ### model to double precision
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.9)
+
+    domain_data = torch.tensor(domain_data, requires_grad=True, device=device, dtype=dtype)
+    init_data = torch.tensor(init_data, device=device, dtype=dtype)
+    left_b_data = torch.tensor(left_b_data, device=device, dtype=dtype)
+    right_b_data = torch.tensor(right_b_data, device=device, dtype=dtype)
+    
+    for epoch in range(epoch_number):
+        start_epoch = time.time()
+
+        if epoch == 10:
+            optimizer = SOAP(params=model.parameters(), lr=learning_rate,
+                             betas=(0.95, 0.95), weight_decay=0.0, precondition_frequency=10)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.92)
+            print(">>> Switched optimizer: Adam → SOAP at epoch 10")
+
+        if epoch <= epoch_resample:
+            domain_data_sample = random_sampling(domain_data, ratio=0.25)
+        else:
+            domain_data_sample = domain_data
+        # Get the residuals
+        domain_residual, init_data_residual, left_b_residual, right_b_residual, initial_v_residual = train_step(model, domain_data_sample, init_data, left_b_data, right_b_data, epoch_resample=epoch_resample, epoch=epoch)
+        # Calculate the losses
+        domain_samples =np.arange(domain_data_sample.shape[0])
+        init_samples = np.arange(init_data.shape[0])
+        left_samples = np.arange(left_b_data.shape[0])
+        right_samples = np.arange(right_b_data.shape[0])
+        
+        if epoch > epoch_resample:
+            domain_samples = resample_points(domain_data_sample, domain_residual, domain_data_sample.shape[0]//10, epoch, epoch_resample)
+            init_samples = resample_points(init_data, init_data_residual, init_data.shape[0]//1, epoch, epoch_resample)
+            left_samples = resample_points(left_b_data, left_b_residual, left_b_data.shape[0]//1, epoch, epoch_resample)
+            right_samples = resample_points(right_b_data, right_b_residual, right_b_data.shape[0]//1, epoch, epoch_resample)
+        
+        if epoch< L1_epoch:
+            domain_loss = torch.mean((domain_residual[domain_samples])**2)
+            init_loss = torch.mean((init_data_residual[init_samples])**2)
+            left_loss = torch.mean((left_b_residual[left_samples])**2)
+            right_loss = torch.mean((right_b_residual[right_samples])**2)
+            init_v_loss = torch.mean((initial_v_residual[init_samples])**2)
+
+        else:
+            domain_loss = torch.mean(torch.abs(domain_residual[domain_samples]))
+            init_loss = torch.mean(torch.abs(init_data_residual[init_samples]))
+            left_loss = torch.mean(torch.abs(left_b_residual[left_samples]))
+            right_loss = torch.mean(torch.abs(right_b_residual[right_samples]))
+            init_v_loss = torch.mean((torch.abs(initial_v_residual[init_samples])))
+
+        # Optimizer step
+        optimizer.zero_grad()
+        w1, w2, w3, w4, w5 = w_schedule(w1_org,w2_org,w3_org,w4_org,w5_org, epoch)
+
+        if (epoch+1) % grad_norm_interval == 0:
+            with torch.no_grad():
+                grad_pde = grad_norm(domain_loss, model)
+                grad_init = grad_norm(init_loss, model)
+                grad_left = grad_norm(left_loss, model)
+                grad_right = grad_norm(right_loss, model)
+                grad_init_v = grad_norm(init_v_loss, model)
+
+            lambda_pde = (grad_pde + grad_init + grad_left + grad_right)/(grad_pde + 1e-9)
+            lambda_init = (grad_pde + grad_init + grad_left + grad_right)/(grad_init + 1e-9)
+            lambda_left = (grad_pde + grad_init + grad_left + grad_right)/(grad_left + 1e-9)
+            lambda_right = (grad_pde + grad_init + grad_left + grad_right)/(grad_right + 1e-9)
+            lambda_init_v = (grad_pde + grad_init + grad_left + grad_right)/(grad_init_v + 1e-9)
+
+            lambda_pde_avg = beta * lambda_pde_avg + (1-beta) * lambda_pde
+            lambda_init_avg = beta * lambda_init_avg + (1-beta) * lambda_init
+            lambda_left_avg = beta * lambda_left_avg + (1-beta)* lambda_left
+            lambda_right_avg = beta * lambda_right_avg + (1-beta)* lambda_right
+            lambda_init_v_avg = beta * lambda_init_v_avg + (1-beta) * lambda_init_v
+            # print("lambda_pde_avg:", lambda_pde_avg)
+            # print("lambda_init_avg", lambda_init_avg)
+            # print("lambda_left_avg:", lambda_left_avg)
+            # print("lambda_right_avg:", lambda_right_avg)
+            # print("lambda_init_v_avg", lambda_init_v_avg)
+        
+        loss = w1*lambda_pde_avg*domain_loss + w2*lambda_init_avg*init_loss + w3*lambda_left_avg*left_loss + w4*lambda_right_avg*right_loss + w5*lambda_init_v_avg*init_v_loss
+        loss_noWeight = domain_loss + init_loss + left_loss + right_loss + init_v_loss
+
+        loss.backward()
+        optimizer.step()
+
+        ### Get the unweighted losses to save 
+        domain_loss_nw = torch.mean(domain_residual**2)
+        init_loss_nw = torch.mean(init_data_residual**2)
+        left_loss_nw = torch.mean(left_b_residual**2)
+        right_loss_nw = torch.mean(right_b_residual**2)
+        init_v_loss_nw = torch.mean(initial_v_residual**2)
+        total_loss_nw = domain_loss_nw  + init_loss_nw + left_loss_nw + right_loss_nw + init_v_loss_nw
+        
+        domain_loss_list.append(np.mean(domain_loss_nw.item()))
+        init_loss_list.append(np.mean(init_loss_nw.item()))
+        left_loss_list.append(np.mean(left_loss_nw.item()))
+        right_loss_list.append(np.mean(right_loss_nw.item()))
+        init_v_loss_list.append(np.mean(init_v_loss_nw.item()))
+        total_loss_list.append(np.mean(total_loss_nw.item()))
+        
+        if (epoch+1)<30000:
+            scheduler.step()
+
+        epoch_time = time.time() - start_epoch
+        if ((epoch+1)%display_every == 0) or (epoch==0):
+            print(f"Total loss: {total_loss_nw.detach()}, Domain loss: {domain_loss_nw.detach()}, \
+            init loss: {init_loss_nw.detach()}, left loss: {left_loss_nw.detach()}, right loss: {right_loss_nw.detach()}, init_v loss: {init_v_loss_nw.detach()} \
+                at epoch {epoch+1}, w1:{w1}, w2:{w2}, w3: {w3}, w4: {w4}")
+            
+            print(" <><><><><><><> epoch time:", epoch_time)
+        if (epoch+1)% checkpoint_interval == 0:
+            best_loss = float('inf')
+            best_loss = save_checkpoint(model, epoch, loss, best_loss, checkpoint_name=checkpoint_name)
+            np.save(f"{checkpoint_name}_PDE_residual.npy",domain_residual.detach().cpu().numpy())
+
+        with torch.no_grad():
+            pred = model(domain_data[:,[0,1]])
+            rel_error = (torch.norm(pred.squeeze() - domain_data[:,-1].squeeze())/torch.norm(domain_data[:,-1].squeeze())).detach().item()
+            relative_error_list.append(rel_error)
+
+        if (epoch+1)% 100 ==0:
+            with open(f'domain_loss_{checkpoint_name}.json','w') as file:
+                json.dump(domain_loss_list, file)
+            with open(f'Init_{checkpoint_name}.json', 'w') as file:
+                json.dump(init_loss_list, file)
+            with open(f'Init_v_{checkpoint_name}.json', 'w') as file:
+                json.dump(init_v_loss_list, file)               
+            with open(f'Left_{checkpoint_name}.json', 'w') as file:
+                json.dump(left_loss_list, file)
+            with open(f'Right_{checkpoint_name}.json', 'w') as file:
+                json.dump(right_loss_list, file)
+            with open(f'Total_{checkpoint_name}.json', 'w') as file:
+                json.dump(total_loss_list, file) 
+            with open(f'Rel_error_{checkpoint_name}.json', 'w') as file:
+                json.dump(relative_error_list, file)
+
+    return domain_loss_list, init_loss_list, total_loss_list, relative_error_list, lambda_pde_avg, lambda_init_avg, lambda_left_avg, lambda_right_avg
+
+def train_lbfgs(model, domain_data, init_data, left_data, right_data,\
+        domain_loss_list, init_loss_list, total_loss_list, relative_error_list, lambda_pde_avg, lambda_init_avg, lambda_left_avg, lambda_right_avg,\
+        max_iter=500, epoch_adam=10000, save_every=10):
+
+    w1_org = 1.0
+    w2_org = 1.0
+    w3_org = 1.0
+    w4_org = 1.0
+    grad_norm_interval = train_cfg["grad_norm_interval"]
+    beta = train_cfg["beta"]
+    ############## Double precision #################
+    dtype = torch.float64 if double else torch.float32
+
+    # Make sure all inputs are tensors on the right device
+    domain_data = torch.tensor(domain_data, requires_grad=True, device=device, dtype=dtype)
+    init_data = torch.tensor(init_data, device=device, dtype=dtype)
+    left_data = torch.tensor(left_data, device=device, dtype=dtype)
+    right_data = torch.tensor(right_data, device=device, dtype=dtype)
+    model = model.to(device=device, dtype=dtype)
+
+    optimizer = torch.optim.LBFGS(
+        model.parameters(),
+        lr=1.0,
+        max_iter=max_iter,
+        max_eval=max_iter,
+        history_size=50,
+        tolerance_grad=1e-12,
+        tolerance_change=1.0 * np.finfo(float).eps,
+        line_search_fn="strong_wolfe"
+    )
+
+    iteration_counter = [0]
+    def closure():
+        optimizer.zero_grad()
+
+        # Compute residuals
+        domain_residual, init_data_residual, left_b_residual, right_b_residual, initial_v_residual = \
+        train_step(model, domain_data_sample, init_data, left_b_data, right_b_data, epoch_resample=0, epoch=0)
+
+        # Loss terms
+        domain_loss = torch.mean(domain_residual**2)
+        init_loss = torch.mean(init_data_residual**2)
+        left_loss = torch.mean(left_b_residual**2)
+        right_loss = torch.mean(right_b_residual**2)
+
+        # Weighted total loss
+
+        if (epoch+1) % grad_norm_interval == 0:
+            with torch.no_grad():
+                grad_pde = grad_norm(domain_loss, model)
+                grad_init = grad_norm(init_loss, model)
+                grad_left = grad_norm(left_loss, model)
+                grad_right = grad_norm(right_loss, model)
+
+            lambda_pde = (grad_pde + grad_init + grad_left + grad_right)/(grad_pde + 1e-9)
+            lambda_init = (grad_pde + grad_init + grad_left + grad_right)/(grad_init + 1e-9)
+            lambda_left = (grad_pde + grad_init + grad_left + grad_right)/(grad_left + 1e-9)
+            lambda_right = (grad_pde + grad_init + grad_left + grad_right)/(grad_right + 1e-9)
+
+            lambda_pde_avg = beta * lambda_pde_avg + (1-beta) * lambda_pde
+            lambda_init_avg = beta * lambda_init_avg + (1-beta) * lambda_init
+            lambda_left_avg = beta * lambda_left_avg + (1-beta)* (lambda_left)
+            lambda_right_avg = beta * lambda_right_avg + (1-beta)* (lambda_right)
+
+        w1, w2, w3, w4 = w_schedule(w1_org, w2_org, w3_org, w4_org, epoch=epoch_adam+iteration_counter[0])
+        loss = w1*lambda_pde_avg*domain_loss + w2*lambda_init_avg*init_loss + w3*lambda_left_avg*left_loss + w4*lambda_right_avg*right_loss
+
+        # Backward
+        loss.backward()
+
+        # Detach for logging
+        domain_loss_list.append(domain_loss.detach().item())
+        init_loss_list.append(init_loss.detach().item())
+        left_loss_list.append(left_loss.detach().item())
+        right_loss_list.append(right_loss.detach().item())
+        total_loss_list.append(loss.detach().item())
+
+        with torch.no_grad():
+            pred = model(domain_data[:,[0,1]]).squeeze()
+            rel_error = (torch.norm(pred - domain_data[:,-1].squeeze())/torch.norm(domain_data[:,-1].squeeze())).detach().item()
+            relative_error_list.append(rel_error)
+
+        iteration_counter[0] +=1
+        if iteration_counter[0] % 1 == 0:
+            # Print losses
+            print(f"[L-BFGS iter {iteration_counter[0]}] Total: {loss.item():.6f}, "
+                    f"Domain: {domain_loss.item():.6f},"
+                    f"Init: {init_loss.item():.6f},"
+                    f"Left: {left_loss.item():.6f},"
+                    f"Right: {right_loss.item():.6f}")
+        
+        best_loss = float('inf')
+        if iteration_counter[0] % save_every == 0:
+            best_loss = save_checkpoint(model, epoch_adam+iteration_counter[0], loss.detach().item(), best_loss, checkpoint_name=checkpoint_name)
+
+        with open(f'domain_loss_{checkpoint_name}.json','w') as file:
+            json.dump(domain_loss_list, file)
+        with open(f'Init_{checkpoint_name}.json', 'w') as file:
+            json.dump(init_loss_list, file)
+        with open(f'Left_{checkpoint_name}.json', 'w') as file:
+            json.dump(left_loss_list, file)
+        with open(f'Right_{checkpoint_name}.json', 'w') as file:
+            json.dump(right_loss_list, file)
+        with open(f'Total_{checkpoint_name}.json', 'w') as file:
+            json.dump(total_loss_list, file)
+        with open(f'Rel_error_{checkpoint_name}.json', 'w') as file:
+            json.dump(relative_error_list, file)
+
+        return loss
+
+    # Run L-BFGS
+    optimizer.step(closure)
+
+    return domain_loss_list, init_loss_list, left_loss_list, right_loss_list, total_loss_list, relative_error_list
+
+# Load data from config
+wave_data_dir = data_cfg["wave_data_dir"]
+domain_data = np.load(os.path.join(wave_data_dir, data_cfg["domain_data_file"]))
+init_data = np.load(os.path.join(wave_data_dir, data_cfg["init_data_file"]))
+left_data = np.load(os.path.join(wave_data_dir + data_cfg["left_b_data_file"]))
+right_data = np.load(os.path.join(wave_data_dir, data_cfg["right_b_data_file"]))
+
+print("domain_data.shape:",domain_data.shape)
+print("init_data.shape:",init_data.shape)
+print("left_data.shape:",left_data.shape)
+print("right_data.shape:",right_data.shape)
+
+display_every = train_cfg["display_every"]
+checkpoint_interval = train_cfg["checkpoint_interval"]
+checkpoint_name = train_cfg["checkpoint_name"]
+
+model = NN(
+    in_c = model_cfg["in_c"],
+    out_c = model_cfg["out_c"],
+    features = model_cfg["features"],
+    activation_name = model_cfg["activation"],
+    num_frequencies = model_cfg["num_frequencies"],
+    fourier_type = model_cfg["fourier_type"],
+    fourier_scale = model_cfg["fourier_scale"],
+    use_siren = model_cfg["use_siren"],
+    siren_w0 = model_cfg["siren_w0"],
+    skip_con= model_cfg["skip_con"],
+    h_siren= model_cfg["h_siren"],
+    learning_w0=model_cfg["learning_w0"]
+)
+model.to(device)
+model.apply(xavier_init_weights)
+
+print("Number of model parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+domain_loss_list, init_loss_list, total_loss_list, relative_error_list, lambda_pde_avg, lambda_init_avg, lambda_left_avg, lambda_right_avg = train(
+    model,
+    epoch_number = train_cfg["adam_epochs"],
+    learning_rate = train_cfg["learning_rate"],
+    domain_data = domain_data,
+    init_data = init_data,
+    left_b_data= left_data,
+    right_b_data= right_data,
+    epoch_resample = train_cfg["epoch_resample"],
+    L1_epoch = train_cfg["L1_epoch"],
+    double = train_cfg["double_precision"]
+)
+
+domain_loss_list_lbfgs, init_loss_list_lbfgs, left_loss_list_lbfgs, right_loss_list_lbfgs, total_loss_list_lbfgs, relative_loss_list_lbfgs = train_lbfgs(
+    model, 
+    domain_data,  
+    init_data, 
+    left_data,
+    right_data,
+    domain_loss_list, init_loss_list, total_loss_list, relative_error_list, lambda_pde_avg, lambda_init_avg, lambda_left_avg, lambda_right_avg,
+    max_iter=20000,
+    epoch_adam=train_cfg["adam_epochs"],
+    save_every=100,
+    double = train_cfg["double_precision"]
+)

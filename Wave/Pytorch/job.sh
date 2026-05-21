@@ -1,0 +1,3 @@
+python -u PINN.py train.adam_epochs=100000 train.learning_rate=1e-3 train.checkpoint_name="PINN" train.checkpoint_interval=1000 train.epoch_resample=50000 model.features="[100,100,100,100,100,100]" \
+        model.skip_con=False train.double_precision=True data.wave_data_dir="/data/data4/" train.grad_norm_interval=500 \
+        weights.w1_org=1.0 weights.w2_org=25.0 weights.w3_org=25.0 weights.w4_org=25.0 train.L1_epoch=100000 model.use_siren=False model.siren_w0=5.0 train.seed=10
