@@ -2,7 +2,7 @@
 
 This repository contains the official implementations and datasets for the paper  
 **"Spectral bias in physics-informed and operator learning: Analysis and mitigation guidelines"**  
-by Siavash Khodakarami, Vivek Oommen, Nazanin Ahmadi Daryakenari, and George Em Karniadakis.
+by Siavash Khodakarami, Vivek Oommen, Nazanin Ahmadi Daryakenari, Maxim Beekenkamp, and George Em Karniadakis.
 
 ---
 
