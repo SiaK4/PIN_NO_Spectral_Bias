@@ -1,0 +1,22 @@
+{
+  "field": {
+    "global_min": -0.3842589259147644,
+    "global_max": 0.3223184645175934
+  },
+  "log_spectrum": {
+    "global_min": -35.716082612988146,
+    "global_max": 1.206872640179529
+  },
+  "barron_spectrum": {
+    "global_min": 0.0,
+    "global_max": 379.29748326536765
+  },
+  "velocity": {
+    "global_min": -1.1552554368972778,
+    "global_max": 1.0098161697387695
+  },
+  "acceleration": {
+    "global_min": -23.033418655395508,
+    "global_max": 22.57351303100586
+  }
+}
